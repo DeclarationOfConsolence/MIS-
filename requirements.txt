@@ -1,0 +1,28 @@
+# ============================================================
+# NapChief MIS Dashboard — module list (for reference)
+# ------------------------------------------------------------
+# NOTE: This is a Node.js project. The REAL dependency file is
+# package.json. To install everything, run:
+#
+#     npm install
+#
+# (npm reads package.json, NOT this file. This list is just so
+#  you can see all modules in one place, like a Python
+#  requirements.txt.)
+# ============================================================
+
+# ---- Runtime dependencies (the app needs these to run) ----
+next==14.2.35          # React framework: frontend + backend API in one (npm run dev)
+react==18.3.1          # UI library
+react-dom==18.3.1      # React renderer for the browser
+recharts==2.12.7       # Charts (bar charts, donut/pie graphs)
+
+# ---- Dev dependencies (used for styling / build) ----
+tailwindcss==3.4.6     # Utility CSS framework (the black & white styling)
+postcss==8.4.39        # CSS processor Tailwind runs on
+autoprefixer==10.4.19  # Adds browser prefixes to CSS automatically
+
+# ============================================================
+# Built-in (no install needed): Node.js 'crypto' module is used
+# in lib/auth.js for signing login sessions.
+# ============================================================

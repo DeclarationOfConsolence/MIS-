@@ -1,0 +1,28 @@
+name: Sync Asana to Supabase
+
+on:
+  # Hourly auto-refresh DISABLED to conserve GitHub Actions minutes.
+  # Re-enable anytime by uncommenting the two lines below.
+  # schedule:
+  #   - cron: "0 * * * *" # every hour, on the hour (UTC)
+  workflow_dispatch: {} # lets you run it manually from the Actions tab
+  repository_dispatch:
+    types: [sync-asana] # fired by the "Sync now" button in the app
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci
+      - name: Run sync
+        run: node scripts/sync.mjs
+        env:
+          ASANA_TOKEN: ${{ secrets.ASANA_TOKEN }}
+          ASANA_WORKSPACE_GID: ${{ secrets.ASANA_WORKSPACE_GID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
