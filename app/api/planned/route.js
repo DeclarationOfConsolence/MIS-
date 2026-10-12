@@ -20,6 +20,7 @@ export async function GET(req) {
   const { data, error } = await sb.rpc("mis_planned_actual", {
     p_from: sp.get("from") || null,
     p_to: sp.get("to") || null,
+    p_meeting_only: sp.get("meeting") === "1",
   });
   if (error) {
     const missing = /mis_planned_actual/.test(error.message);

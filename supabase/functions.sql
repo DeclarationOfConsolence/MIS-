@@ -251,3 +251,123 @@ returns jsonb language sql stable as $$
                   else null end) asc nulls last), '[]'::jsonb)
   from p;
 $$;
+
+-- ---- Meeting-task detection: captured by the sync from each task's parent ----
+-- Populated by scripts/sync.mjs's isMeetingTask() — see there for the full rule
+-- (parent task looks like a meeting, OR sits on a board named "...meeting...",
+-- OR the task name itself is a recording-derived action point).
+alter table mis_tasks add column if not exists parent_name text;
+alter table mis_tasks add column if not exists is_meeting boolean default false;
+create index if not exists idx_mis_tasks_is_meeting on mis_tasks (is_meeting) where is_meeting;
+
+-- ---- Planned vs Actual, with an optional "meeting APs only" filter ----
+-- Same exact scoring as mis_planned_actual above — just scoped to is_meeting
+-- tasks when p_meeting_only is true. Used by the Report tab's Meeting section.
+-- Effective planned date = Planned End Date, falling back to the Asana DUE DATE
+-- only when no Planned End Date is set (due date is set far more often, so this
+-- makes far more tasks scorable/date-bucketed instead of landing in "unplanned").
+-- Meeting APs are sometimes COPIED onto a one-time board (new gid) instead of
+-- properly multi-homed — so the same AP can show up twice. Dedup: same
+-- assignee + same parent task + same task name = counted once, keeping
+-- whichever copy has a planned date, then whichever is completed (same
+-- preference order as build_meeting.js's rank()). Non-meeting rows are
+-- partitioned by their own gid, so this never collapses unrelated one-time
+-- tasks that merely share a name.
+drop function if exists mis_planned_actual(date, date);
+drop function if exists mis_planned_actual(date, date, boolean);
+create or replace function mis_planned_actual(p_from date default null, p_to date default null, p_meeting_only boolean default false)
+returns jsonb language sql stable as $$
+  with raw as (
+    select assignee, created_at, actual_end_date, completed,
+      coalesce(planned_end_date::date, due_on::date) as eff_date,
+      row_number() over (
+        partition by assignee,
+          case when is_meeting then 1 else 0 end,
+          case when is_meeting then lower(trim(regexp_replace(coalesce(parent_name, ''), '\s+', ' ', 'g'))) else gid end,
+          case when is_meeting then lower(trim(regexp_replace(coalesce(name, ''), '\s+', ' ', 'g'))) end
+        order by (planned_end_date is not null) desc, completed desc
+      ) as rn
+    from mis_tasks
+    where is_one_time
+      and coalesce(archived, false) = false
+      and (not p_meeting_only or coalesce(is_meeting, false))
+  ),
+  base as (
+    select assignee, created_at, actual_end_date, eff_date from raw where rn = 1
+  ),
+  p as (
+    select assignee,
+      count(*) filter (where (eff_date is not null and (p_from is null or eff_date >= p_from) and (p_to is null or eff_date <= p_to))
+                          or (eff_date is null and (p_from is null or created_at::date >= p_from) and (p_to is null or created_at::date <= p_to))) as total,
+      count(*) filter (where eff_date is null and (p_from is null or created_at::date >= p_from) and (p_to is null or created_at::date <= p_to)) as unplanned,
+      count(*) filter (where eff_date is not null and (p_from is null or eff_date >= p_from) and (p_to is null or eff_date <= p_to)) as planned,
+      count(*) filter (where eff_date is not null and (p_from is null or eff_date >= p_from) and (p_to is null or eff_date <= p_to) and actual_end_date is not null and actual_end_date::date <= eff_date) as on_time,
+      count(*) filter (where eff_date is not null and (p_from is null or eff_date >= p_from) and (p_to is null or eff_date <= p_to) and actual_end_date is not null and actual_end_date::date > eff_date and (actual_end_date::date - eff_date) <= 7) as late,
+      count(*) filter (where eff_date is not null and (p_from is null or eff_date >= p_from) and (p_to is null or eff_date <= p_to) and actual_end_date is not null and (actual_end_date::date - eff_date) > 7) as late_over_7,
+      count(*) filter (where eff_date is not null and (p_from is null or eff_date >= p_from) and (p_to is null or eff_date <= p_to) and actual_end_date is null) as not_done
+    from base
+    group by assignee
+    having count(*) > 0
+  )
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'assignee', assignee, 'total', total, 'unplanned', unplanned, 'planned', planned,
+    'on_time', on_time, 'late', late,
+    'delay_over_1week', late_over_7, 'not_done', not_done,
+    'score', case when (planned - late_over_7) > 0
+                  then round(100.0 * (on_time + late) / (planned - late_over_7)) - 100
+                  else null end
+  ) order by (case when (planned - late_over_7) > 0
+                  then round(100.0 * (on_time + late) / (planned - late_over_7)) - 100
+                  else null end) asc nulls last), '[]'::jsonb)
+  from p;
+$$;
+
+-- ---- Status summary (Completed / Overdue / Pending / No date set) ----
+-- Used by the Overall Summary tab. Same effective-date (Planned End Date,
+-- falling back to due date) and same meeting-dedup logic as mis_planned_actual,
+-- but bucketed as plain status counts instead of on-time/late scoring:
+--   Completed = done.  Overdue = open, effective date before TODAY.
+--   Pending   = open, effective date today or later.  No date set = open, no date at all.
+-- These 4 buckets are mutually exclusive and sum to Total.
+create or replace function mis_task_status_summary(p_from date default null, p_to date default null, p_meeting_only boolean default false)
+returns jsonb language sql stable as $$
+  with raw as (
+    select assignee, created_at, completed,
+      coalesce(planned_end_date::date, due_on::date) as eff_date,
+      row_number() over (
+        partition by assignee,
+          case when is_meeting then 1 else 0 end,
+          case when is_meeting then lower(trim(regexp_replace(coalesce(parent_name, ''), '\s+', ' ', 'g'))) else gid end,
+          case when is_meeting then lower(trim(regexp_replace(coalesce(name, ''), '\s+', ' ', 'g'))) end
+        order by (planned_end_date is not null) desc, completed desc
+      ) as rn
+    from mis_tasks
+    where is_one_time
+      and coalesce(archived, false) = false
+      and (not p_meeting_only or coalesce(is_meeting, false))
+  ),
+  scoped as (
+    select assignee, completed, eff_date from raw
+    where rn = 1
+      and (
+        (eff_date is not null and (p_from is null or eff_date >= p_from) and (p_to is null or eff_date <= p_to))
+        or (eff_date is null and (p_from is null or created_at::date >= p_from) and (p_to is null or created_at::date <= p_to))
+      )
+  ),
+  s as (
+    select assignee,
+      count(*) as total,
+      count(*) filter (where completed) as completed,
+      count(*) filter (where not completed and eff_date is not null and eff_date < current_date) as overdue,
+      count(*) filter (where not completed and eff_date is not null and eff_date >= current_date) as pending,
+      count(*) filter (where not completed and eff_date is null) as no_date
+    from scoped
+    group by assignee
+    having count(*) > 0
+  )
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'assignee', assignee, 'total', total, 'completed', completed,
+    'overdue', overdue, 'pending', pending, 'no_date', no_date
+  ) order by assignee), '[]'::jsonb)
+  from s;
+$$;

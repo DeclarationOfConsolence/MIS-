@@ -5,7 +5,21 @@ import { useRouter } from "next/navigation";
 import { StatusDonut, PerAssigneeBar, PerProjectBar } from "@/components/Charts";
 import Logo from "@/components/Logo";
 
-const TABS = ["One Time Tasks", "To-Do Tasks", "Planned vs Actual", "Tasks", "Team", "Charts", "Activity", "Overview"];
+const TABS = ["Overall Summary", "Report", "One Time Tasks", "To-Do Tasks", "Planned vs Actual", "Tasks", "Team", "Charts", "Activity"];
+
+// Monday–Saturday week bounds (IST), for a given offset (0 = current week, 1 = last week, …).
+function weekBounds(offset) {
+  const istToday = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+  const base = new Date(istToday + "T00:00:00Z");
+  const dow = base.getUTCDay(); // 0 Sun .. 6 Sat
+  const mondayOffset = dow === 0 ? 6 : dow - 1;
+  const monday = new Date(base);
+  monday.setUTCDate(base.getUTCDate() - mondayOffset - offset * 7);
+  const saturday = new Date(monday);
+  saturday.setUTCDate(monday.getUTCDate() + 5);
+  const fmt = (x) => x.toISOString().slice(0, 10);
+  return { from: fmt(monday), to: fmt(saturday) };
+}
 
 export default function Dashboard() {
   const router = useRouter();
@@ -32,6 +46,15 @@ export default function Dashboard() {
   const [plannedFrom, setPlannedFrom] = useState(""); // empty = all time
   const [plannedTo, setPlannedTo] = useState("");
   const [refreshTick, setRefreshTick] = useState(0);
+  const [reportFrom, setReportFrom] = useState(""); // empty = all time, same default as the Planned vs Actual tab
+  const [reportTo, setReportTo] = useState("");
+  const [reportSection, setReportSection] = useState("planned"); // "planned" | "todo" | "meeting"
+  const [reportPlanned, setReportPlanned] = useState(null);
+  const [reportMeeting, setReportMeeting] = useState(null);
+  const [reportTodo, setReportTodo] = useState(null);
+  const [overallFrom, setOverallFrom] = useState(""); // empty = all time
+  const [overallTo, setOverallTo] = useState("");
+  const [overall, setOverall] = useState(null);
 
   // filters
   const [search, setSearch] = useState("");
@@ -192,6 +215,71 @@ export default function Dashboard() {
       cancelled = true;
     };
   }, [tab, plannedFrom, plannedTo, refreshTick]);
+
+  // load the Report tab's 3 sections (Planned vs Actual, Meeting, To-Do) for the
+  // selected range — empty from/to = all time, same default as Planned vs Actual.
+  // Real-time: refetches on range change and every refresh tick.
+  useEffect(() => {
+    if (tab !== "Report") return;
+    let cancelled = false;
+    const base = new URLSearchParams();
+    if (reportFrom) base.set("from", reportFrom);
+    if (reportTo) base.set("to", reportTo);
+
+    fetch(`/api/planned?${base.toString()}`)
+      .then((r) => r.json())
+      .then((j) => {
+        if (!cancelled) setReportPlanned(j);
+      })
+      .catch((e) => {
+        if (!cancelled) setReportPlanned({ error: "DB_ERROR", message: String(e) });
+      });
+
+    const mp = new URLSearchParams(base);
+    mp.set("meeting", "1");
+    fetch(`/api/planned?${mp.toString()}`)
+      .then((r) => r.json())
+      .then((j) => {
+        if (!cancelled) setReportMeeting(j);
+      })
+      .catch((e) => {
+        if (!cancelled) setReportMeeting({ error: "DB_ERROR", message: String(e) });
+      });
+
+    fetch(`/api/report/todo?${base.toString()}`)
+      .then((r) => r.json())
+      .then((j) => {
+        if (!cancelled) setReportTodo(j);
+      })
+      .catch((e) => {
+        if (!cancelled) setReportTodo({ error: "DB_ERROR", message: String(e) });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [tab, reportFrom, reportTo, refreshTick]);
+
+  // load the Overall Summary tab (One-Time + Meeting + To-Do combined per person)
+  // — real-time: refetches on range change and every refresh tick.
+  useEffect(() => {
+    if (tab !== "Overall Summary") return;
+    let cancelled = false;
+    const p = new URLSearchParams();
+    if (overallFrom) p.set("from", overallFrom);
+    if (overallTo) p.set("to", overallTo);
+    fetch(`/api/report/overall?${p.toString()}`)
+      .then((r) => r.json())
+      .then((j) => {
+        if (!cancelled) setOverall(j);
+      })
+      .catch((e) => {
+        if (!cancelled) setOverall({ error: "DB_ERROR", message: String(e) });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [tab, overallFrom, overallTo, refreshTick]);
 
   // load the Daily to-do scorecard when the tab is open (and on each refresh tick)
   useEffect(() => {
@@ -407,19 +495,6 @@ export default function Dashboard() {
 
         {!err && data && data.totalTasks > 0 && (
           <>
-            {tab === "Overview" && (
-              <div className="space-y-4">
-                <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
-                  <KPI label="Total Tasks" value={kpis.total} color="text-indigo-600 dark:text-indigo-400" />
-                  <KPI label="Completed" value={kpis.completed} color="text-green-600 dark:text-green-400" />
-                  <KPI label="Open" value={kpis.open} color="text-amber-600 dark:text-amber-400" />
-                  <KPI label="Overdue" value={kpis.overdue} color="text-red-600 dark:text-red-400" />
-                  <KPI label="Archived" value={kpis.archived} color="text-gray-500 dark:text-gray-400" />
-                </div>
-                <AssigneeTable rows={perAssignee} />
-              </div>
-            )}
-
             {tab === "Team" && (
               <div className="space-y-4">
                 <PerAssigneeBar rows={perAssignee} dark={dark} />
@@ -473,6 +548,24 @@ export default function Dashboard() {
             )}
 
             {tab === "Activity" && <ActivityFeed data={activity} onSelect={setDetailGid} />}
+
+            {tab === "Overall Summary" && (
+              <OverallSummaryTab from={overallFrom} to={overallTo} onFrom={setOverallFrom} onTo={setOverallTo} data={overall} />
+            )}
+
+            {tab === "Report" && (
+              <ReportTab
+                from={reportFrom}
+                to={reportTo}
+                onFrom={setReportFrom}
+                onTo={setReportTo}
+                section={reportSection}
+                onSection={setReportSection}
+                planned={reportPlanned}
+                meeting={reportMeeting}
+                todo={reportTodo}
+              />
+            )}
           </>
         )}
       </div>
@@ -834,32 +927,34 @@ function dailyStats(daily, person) {
   const weekDates = daily.weekDates || [];
   const todayStr = istTodayStr();
   const tasks = (daily.rows || []).filter((r) => r.person === person);
-  // Full week: every Mon–Sat day is an opportunity → denominator = tasks × 6.
+  // Only days that have actually happened are real opportunities — a day later
+  // this week hasn't been missed yet, it just hasn't arrived.
+  const endedDates = weekDates.filter((d) => d <= todayStr);
   let done = 0;
   for (const t of tasks) {
     const set = new Set(t.dates || []);
-    for (const d of weekDates) if (set.has(d)) done++;
+    for (const d of endedDates) if (set.has(d)) done++;
   }
-  const total = tasks.length * weekDates.length;
+  const total = tasks.length * endedDates.length;
   const pct = total ? Math.round((100 * done) / total) : null;
   return { pct, done, total, tasks, weekDates, todayStr };
 }
 
-// Recurring completion across the WHOLE window: (on-time + late) ÷ cells that had a
-// cycle due ('none' = no cycle that period, so it's not an opportunity).
+// Recurring completion across the WHOLE window: (on-time + late) ÷ periods that
+// have actually ENDED (the current, still-in-progress period isn't due yet, so
+// it isn't a real miss — same reasoning as dailyStats above).
 function recurringStats(recurring, kind, person) {
   if (!recurring || recurring.error) return null;
   const data = (recurring && recurring[kind]) || { periods: [], rows: [] };
   const periods = data.periods || [];
+  const endedCount = data.endedCount ?? periods.length; // fallback for older API responses
   const tasks = (data.rows || []).filter((r) => r.person === person);
-  // Full window: EVERY period shown is an opportunity → denominator = tasks ×
-  // periods (including periods with no cycle due). Completed = on-time + late.
   let done = 0;
   let total = 0;
   for (const t of tasks) {
     if (!t.has_due) continue;
-    total += periods.length;
-    for (const v of t.cells || []) {
+    total += endedCount;
+    for (const v of (t.cells || []).slice(0, endedCount)) {
       if (v === "on_time" || v === "late") done++;
     }
   }
@@ -1323,6 +1418,253 @@ function PerformancePersonDrawer({ person, tasks, onClose, onSelectTask }) {
         )}
       </div>
     </div>
+  );
+}
+
+// ====================== Report tab (Planned vs Actual / Meeting / To-Do, by date range) ======================
+const REPORT_SECTIONS = [
+  { key: "planned", label: "Planned vs Actual (One-Time)" },
+  { key: "todo", label: "To-Do" },
+  { key: "meeting", label: "Meeting" },
+];
+function ReportTab({ from, to, onFrom, onTo, section, onSection, planned, meeting, todo }) {
+  return (
+    <div className="space-y-4">
+      <Panel>
+        <div className="flex flex-wrap items-end justify-between gap-3">
+          <div className="flex flex-wrap items-end gap-3">
+            <div>
+              <label className="filter-label">From</label>
+              <input type="date" value={from} onChange={(e) => onFrom(e.target.value)} className="filter-input" />
+            </div>
+            <div>
+              <label className="filter-label">To</label>
+              <input type="date" value={to} onChange={(e) => onTo(e.target.value)} className="filter-input" />
+            </div>
+          </div>
+          <div className="flex gap-2">
+            {REPORT_SECTIONS.map((s) => (
+              <button
+                key={s.key}
+                onClick={() => onSection(s.key)}
+                className={`px-3 py-1.5 rounded-lg text-sm font-semibold transition ${
+                  section === s.key
+                    ? "bg-indigo-600 text-white"
+                    : "bg-gray-100 dark:bg-[#1a1a1a] text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-[#242424]"
+                }`}
+              >
+                {s.label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <p className="text-xs text-gray-400 mt-2">
+          Blank From/To = all time for Planned vs Actual and Meeting. To-Do always scores a bounded window (ticks ÷ tasks ×
+          days) — blank defaults to the last 90 days rather than all time, since a multi-year span would inflate the
+          denominator for recently-added tasks.
+        </p>
+      </Panel>
+
+      {section === "planned" && <ReportScoreTable title="Planned vs Actual (One-Time)" data={planned} columns="full" />}
+      {section === "meeting" && <ReportScoreTable title="Meeting" data={meeting} columns="full" />}
+      {section === "todo" && <ReportScoreTable title="To-Do" data={todo} columns="todo" />}
+    </div>
+  );
+}
+
+// `columns="full"` rows come from mis_planned_actual: { assignee, total, unplanned, planned, on_time, late,
+// delay_over_1week, not_done, score }. `columns="todo"` rows come from /api/report/todo: { person, total, completed, score }
+// — only Total + Score are shown for To-Do, per the simpler recurring-task model (no overdue/no-date concept there).
+function ReportScoreTable({ title, data, columns }) {
+  if (!data) return <Panel><p className="text-sm text-gray-500">Loading {title.toLowerCase()}…</p></Panel>;
+  if (data.error) {
+    return (
+      <Panel>
+        <p className="font-semibold text-amber-600 dark:text-amber-400 mb-1">{title} not ready</p>
+        <p className="text-sm text-gray-500">{data.message || "Run the required SQL in Supabase."}</p>
+      </Panel>
+    );
+  }
+  const rows = (data.rows || []).map((r) =>
+    columns === "todo"
+      ? { name: r.person, total: r.total, score: r.score }
+      : {
+          name: r.assignee,
+          total: r.total,
+          completed: r.planned - r.not_done,
+          overdue: r.not_done,
+          noDate: r.unplanned,
+          score: r.score,
+        }
+  );
+  return (
+    <Panel>
+      <h2 className="font-semibold text-sm mb-3">{title}</h2>
+      <div className="overflow-x-auto max-h-[65vh]">
+        <table className="w-full text-sm">
+          <thead className="sticky top-0 bg-white dark:bg-[#141414]">
+            <tr className="text-left text-xs uppercase tracking-wide text-gray-400 border-b border-gray-200 dark:border-gray-800">
+              <th className="py-2.5 px-2">Name</th>
+              <th className="py-2.5 px-2">Total</th>
+              {columns === "full" && <th className="py-2.5 px-2">Completed</th>}
+              {columns === "full" && <th className="py-2.5 px-2">Overdue</th>}
+              {columns === "full" && <th className="py-2.5 px-2">No date set</th>}
+              <th className="py-2.5 px-2">Score</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.length === 0 && (
+              <tr>
+                <td colSpan={columns === "full" ? 6 : 3} className="py-6 text-center text-gray-400">
+                  No data for this range.
+                </td>
+              </tr>
+            )}
+            {rows.map((r) => (
+              <tr key={r.name} className="border-b border-gray-100 dark:border-gray-900 hover:bg-gray-50 dark:hover:bg-[#1a1a1a]">
+                <td className="py-2.5 px-2 font-medium">{r.name}</td>
+                <td className="py-2.5 px-2">{r.total}</td>
+                {columns === "full" && <td className="py-2.5 px-2 text-green-600 dark:text-green-400">{r.completed}</td>}
+                {columns === "full" && <td className="py-2.5 px-2 text-red-600 dark:text-red-400">{r.overdue}</td>}
+                {columns === "full" && <td className="py-2.5 px-2 text-gray-500">{r.noDate}</td>}
+                <td className="py-2.5 px-2">
+                  {r.score == null ? (
+                    <span className="text-gray-400">—</span>
+                  ) : (
+                    <span className={`inline-block px-2 py-1 rounded-md text-xs font-semibold ${scoreBadge(r.score)}`}>{r.score}%</span>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Panel>
+  );
+}
+
+// ====================== Overall Summary (One-Time + Meeting + To-Do combined) ======================
+function OverallSummaryTab({ from, to, onFrom, onTo, data }) {
+  const [q, setQ] = useState("");
+  return (
+    <div className="space-y-4">
+      <Panel>
+        <h2 className="font-semibold text-sm mb-1">Overall Summary — every task type, per person</h2>
+        <p className="text-xs text-gray-400 mb-3">
+          <span className="font-semibold">Total</span> = One-Time + To-Do (Meeting is already counted inside One-Time, so
+          it's shown separately and not added again). Completed/Overdue/Pending/No-date-set come <span className="font-semibold">only</span> from
+          One-Time's status (they sum to the One-Time column, not the grand Total) — To-Do is deliberately excluded from
+          these 4 buckets, since a recurring task's "done" count is a count of ticks, not a task-level completion state,
+          and mixing the two would make Completed exceed Total. Blank From/To = all time.
+        </p>
+        <div className="flex flex-wrap items-end gap-3">
+          <div>
+            <label className="filter-label">From</label>
+            <input type="date" value={from} onChange={(e) => onFrom(e.target.value)} className="filter-input" />
+          </div>
+          <div>
+            <label className="filter-label">To</label>
+            <input type="date" value={to} onChange={(e) => onTo(e.target.value)} className="filter-input" />
+          </div>
+          <div className="flex-1 min-w-[160px]">
+            <label className="filter-label">Search</label>
+            <input
+              type="text"
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="Filter by name…"
+              className="filter-input w-full"
+            />
+          </div>
+        </div>
+      </Panel>
+
+      <OverallSummaryTable data={data} q={q} />
+    </div>
+  );
+}
+
+function OverallSummaryTable({ data, q }) {
+  if (!data) return <Panel><p className="text-sm text-gray-500">Loading…</p></Panel>;
+  if (data.error) {
+    return (
+      <Panel>
+        <p className="font-semibold text-amber-600 dark:text-amber-400 mb-1">Overall Summary not ready</p>
+        <p className="text-sm text-gray-500">{data.message || "Run the required SQL in Supabase."}</p>
+      </Panel>
+    );
+  }
+  const rows = data.rows || [];
+  const s = q.trim().toLowerCase();
+  const filtered = s ? rows.filter((r) => r.assignee.toLowerCase().includes(s)) : rows;
+  const totals = filtered.reduce(
+    (a, r) => ({
+      total: a.total + r.total,
+      oneTime: a.oneTime + r.oneTime,
+      meeting: a.meeting + r.meeting,
+      todo: a.todo + r.todo,
+      completed: a.completed + r.completed,
+      overdue: a.overdue + r.overdue,
+      pending: a.pending + r.pending,
+      noDate: a.noDate + r.noDate,
+    }),
+    { total: 0, oneTime: 0, meeting: 0, todo: 0, completed: 0, overdue: 0, pending: 0, noDate: 0 }
+  );
+  return (
+    <Panel>
+      <p className="text-xs text-gray-400 mb-3">
+        {filtered.length} people · total {totals.total.toLocaleString()} · one-time {totals.oneTime.toLocaleString()} ·
+        meeting {totals.meeting.toLocaleString()} · to-do {totals.todo.toLocaleString()} · completed{" "}
+        {totals.completed.toLocaleString()} · overdue {totals.overdue.toLocaleString()} · pending{" "}
+        {totals.pending.toLocaleString()} · no date {totals.noDate.toLocaleString()}
+      </p>
+      <div className="overflow-x-auto max-h-[70vh]">
+        <table className="w-full text-sm">
+          <thead className="sticky top-0 bg-white dark:bg-[#141414]">
+            <tr className="text-left text-xs uppercase tracking-wide text-gray-400 border-b border-gray-200 dark:border-gray-800">
+              <th className="py-2.5 px-2">Name</th>
+              <th className="py-2.5 px-2">Total</th>
+              <th className="py-2.5 px-2">One-Time</th>
+              <th className="py-2.5 px-2">— Meeting</th>
+              <th className="py-2.5 px-2">To-Do</th>
+              <th className="py-2.5 px-2">Completed</th>
+              <th className="py-2.5 px-2">Overdue</th>
+              <th className="py-2.5 px-2">Pending</th>
+              <th className="py-2.5 px-2">No date set</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.length === 0 && (
+              <tr>
+                <td colSpan={9} className="py-6 text-center text-gray-400">
+                  No data for this range.
+                </td>
+              </tr>
+            )}
+            {filtered.map((r) => (
+              <tr key={r.assignee} className="border-b border-gray-100 dark:border-gray-900 hover:bg-gray-50 dark:hover:bg-[#1a1a1a]">
+                <td className="py-2.5 px-2 font-medium">
+                  <div className="flex items-center gap-2">
+                    <span className="w-7 h-7 rounded-full bg-indigo-100 dark:bg-indigo-950 text-indigo-600 dark:text-indigo-300 flex items-center justify-center text-xs font-semibold">
+                      {initials(r.assignee)}
+                    </span>
+                    <span className="font-medium">{r.assignee}</span>
+                  </div>
+                </td>
+                <td className="py-2.5 px-2 font-semibold">{r.total}</td>
+                <td className="py-2.5 px-2">{r.oneTime}</td>
+                <td className="py-2.5 px-2 text-gray-500 dark:text-gray-400">{r.meeting}</td>
+                <td className="py-2.5 px-2">{r.todo}</td>
+                <td className="py-2.5 px-2 text-green-600 dark:text-green-400">{r.completed}</td>
+                <td className="py-2.5 px-2 text-red-600 dark:text-red-400">{r.overdue}</td>
+                <td className="py-2.5 px-2 text-amber-600 dark:text-amber-400">{r.pending}</td>
+                <td className="py-2.5 px-2 text-gray-500">{r.noDate}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Panel>
   );
 }
 

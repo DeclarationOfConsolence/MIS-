@@ -56,6 +56,34 @@ function oneTimeSection(assignee, memberships) {
   return null;
 }
 
+// ---- Meeting task (AP) detection ----------------------------------
+// A task is a meeting action point if it has a parent task, or sits on a board
+// named "...One Time..." (otherwise it's excluded outright — this filters out
+// the meeting's own container task, which isn't an AP itself), AND either:
+//  - it sits on a board whose name contains "meeting", OR
+//  - its PARENT task's name looks like a meeting (a date, or says "meeting") —
+//    this catches meetings not filed under the dedicated meetings board, OR
+//  - its own name ends in a recording timestamp like "(12:34)" (how Fireflies
+//    names action items), OR
+//  - its name contains a fathom.video recording link.
+const MON_RE = "(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*";
+function isDateName(s) {
+  return (
+    new RegExp(`\\b\\d{1,2}(st|nd|rd|th)?\\s+${MON_RE}\\b`, "i").test(s) ||
+    new RegExp(`\\b${MON_RE}\\s+\\d{1,2}(st|nd|rd|th)?\\b`, "i").test(s) ||
+    /\b\d{1,2}[\/.-]\d{1,2}([\/.-]\d{2,4})?\b/.test(s)
+  );
+}
+function isMeetingTask(name, parentName, projects) {
+  const projs = projects || [];
+  if (!parentName && !projs.some((p) => /one\s*time/i.test(p))) return false;
+  if (projs.some((p) => /meeting/i.test(p))) return true;
+  if (parentName && (isDateName(parentName) || /meeting/i.test(parentName))) return true;
+  if (/\(\d{1,2}:\d{2}(:\d{2})?\)\s*$/.test(name || "")) return true;
+  if (/fathom\.video/i.test(name || "")) return true;
+  return false;
+}
+
 // The section a task sits in WITHIN the assignee's OWN board (board named after
 // the person — e.g. "Dipti's To-Do Board"). Ignores shared/team boards like
 // "Inventory's TO-DO Board". Prefers the To-Do board, then one-time, then any.
@@ -98,6 +126,8 @@ for (const t of d.tasks) {
       created_at: t.created_at,
       due_on: t.due_on,
       is_one_time: isOneTime(t.assignee, t.projects || (t.project ? [t.project] : [])),
+      parent_name: t.parent_name || null,
+      is_meeting: isMeetingTask(t.name, t.parent_name, t.projects || (t.project ? [t.project] : [])),
       one_time_section: oneTimeSection(t.assignee, t.memberships),
       own_section: ownSection(t.assignee, t.memberships),
       archived: t.archived || false,
@@ -151,6 +181,18 @@ if (ownProbe.error && /own_section/i.test(ownProbe.error.message)) {
   for (const r of rows) delete r.own_section;
 }
 
+// parent_name / is_meeting columns — resilient if missing (run the SQL to enable the Meeting report)
+const pnProbe = await sb.from("mis_tasks").select("parent_name").limit(1);
+if (pnProbe.error && /parent_name/i.test(pnProbe.error.message)) {
+  console.log("ℹ 'parent_name' column not found — syncing without it. Run the SQL to enable meeting-task detection.");
+  for (const r of rows) delete r.parent_name;
+}
+const imProbe = await sb.from("mis_tasks").select("is_meeting").limit(1);
+if (imProbe.error && /is_meeting/i.test(imProbe.error.message)) {
+  console.log("ℹ 'is_meeting' column not found — syncing without it. Run the SQL to enable the Meeting report.");
+  for (const r of rows) delete r.is_meeting;
+}
+
 // archived column — resilient if missing (run the SQL to enable archived hiding)
 const archProbe = await sb.from("mis_tasks").select("archived").limit(1);
 if (archProbe.error && /archived/i.test(archProbe.error.message)) {
@@ -169,11 +211,28 @@ if (pgProbe.error && /project_gids/i.test(pgProbe.error.message)) {
   for (const r of rows) delete r.project_gids;
 }
 
+// Retry a transient network error (e.g. "fetch failed" from a flaky connection)
+// up to 5 times with backoff, same pattern asanaGet already uses for Asana calls.
+// A real database error (bad column, constraint violation) still fails fast —
+// only network-shaped errors are worth retrying.
+async function upsertChunkWithRetry(sb, table, chunk, attempt = 0) {
+  const { error } = await sb.from(table).upsert(chunk, { onConflict: "gid" });
+  if (!error) return null;
+  const transient = /fetch failed|ECONNRESET|ETIMEDOUT|network|timeout/i.test(error.message || "");
+  if (transient && attempt < 5) {
+    const wait = Math.min(1000 * 2 ** attempt, 15000);
+    console.warn(`⚠ Upsert network error (attempt ${attempt + 1}/5), retrying in ${wait}ms: ${error.message}`);
+    await new Promise((r) => setTimeout(r, wait));
+    return upsertChunkWithRetry(sb, table, chunk, attempt + 1);
+  }
+  return error;
+}
+
 const CHUNK = 500;
 let upsertOk = true;
 for (let i = 0; i < rows.length; i += CHUNK) {
   const chunk = rows.slice(i, i + CHUNK);
-  const { error } = await sb.from("mis_tasks").upsert(chunk, { onConflict: "gid" });
+  const error = await upsertChunkWithRetry(sb, "mis_tasks", chunk);
   if (error) {
     console.error("✗ Upsert error:", error.message);
     upsertOk = false;
