@@ -880,6 +880,21 @@ function ToDoTasks({ daily, recurring, person, onPerson }) {
 
   const loading = !daily || !recurring;
 
+  // Total task count per person = distinct to-do tasks across every cadence
+  // (Daily + Weekly + Bi-Weekly + Monthly + Bi-Monthly + Quarterly).
+  const personTotals = useMemo(() => {
+    return people
+      .map((p) => {
+        let count = dailyStats(daily, p)?.tasks.length || 0;
+        for (const { kind } of RECURRING_SECTIONS) {
+          count += recurringStats(recurring, kind, p)?.tasks.length || 0;
+        }
+        return { person: p, total: count };
+      })
+      .sort((a, b) => b.total - a.total);
+  }, [people, daily, recurring]);
+  const grandTotal = personTotals.reduce((a, r) => a + r.total, 0);
+
   // Total Average Completion = simple average of the per-section %s the person
   // actually has (empty sections don't drag it down).
   const sectionPcts = [];
@@ -904,6 +919,46 @@ function ToDoTasks({ daily, recurring, person, onPerson }) {
         (late still counts as done). The badge at the <span className="font-semibold">top-right</span> is their{" "}
         <span className="font-semibold">total average completion</span> across all sections.
       </p>
+
+      {!loading && (
+        <div className="border border-gray-100 dark:border-gray-900 rounded-xl p-3 mb-4">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="font-semibold text-sm">Total to-do tasks</h3>
+            <span className="text-sm font-bold">
+              {grandTotal.toLocaleString()} <span className="font-normal text-gray-400">across {personTotals.length} people</span>
+            </span>
+          </div>
+          <div className="overflow-x-auto max-h-56">
+            <table className="w-full text-sm">
+              <thead className="sticky top-0 bg-white dark:bg-[#141414]">
+                <tr className="text-left text-[11px] uppercase tracking-wide text-gray-400 border-b border-gray-200 dark:border-gray-800">
+                  <th className="py-1.5 px-2">Person</th>
+                  <th className="py-1.5 px-2">Total tasks</th>
+                </tr>
+              </thead>
+              <tbody>
+                {personTotals.length === 0 && (
+                  <tr>
+                    <td colSpan={2} className="py-3 text-center text-gray-400">
+                      No to-do tasks found.
+                    </td>
+                  </tr>
+                )}
+                {personTotals.map((r) => (
+                  <tr
+                    key={r.person}
+                    onClick={() => onPerson(r.person)}
+                    className="border-b border-gray-100 dark:border-gray-900 hover:bg-gray-50 dark:hover:bg-[#1a1a1a] cursor-pointer"
+                  >
+                    <td className="py-1.5 px-2 font-medium">{r.person}</td>
+                    <td className="py-1.5 px-2">{r.total}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
       <div className="flex items-end gap-2 mb-4">
         <div className="w-full max-w-xs">
