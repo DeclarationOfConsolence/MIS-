@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { StatusDonut, PerAssigneeBar, PerProjectBar } from "@/components/Charts";
 import Logo from "@/components/Logo";
 
-const TABS = ["Overall Summary", "Report", "One Time Tasks", "To-Do Tasks", "Planned vs Actual", "Tasks", "Team", "Charts", "Activity"];
+const TABS = ["Overall Summary", "Report", "Meeting", "One Time Tasks", "To-Do Tasks", "Planned vs Actual", "Tasks", "Team", "Charts", "Activity"];
 
 // Monday–Saturday week bounds (IST), for a given offset (0 = current week, 1 = last week, …).
 function weekBounds(offset) {
@@ -48,10 +48,13 @@ export default function Dashboard() {
   const [refreshTick, setRefreshTick] = useState(0);
   const [reportFrom, setReportFrom] = useState(""); // empty = all time, same default as the Planned vs Actual tab
   const [reportTo, setReportTo] = useState("");
-  const [reportSection, setReportSection] = useState("planned"); // "planned" | "todo" | "meeting"
+  const [meetingFrom, setMeetingFrom] = useState(""); // empty = all time
+  const [meetingTo, setMeetingTo] = useState("");
+  const [meetingTabData, setMeetingTabData] = useState(null);
   const [reportPlanned, setReportPlanned] = useState(null);
   const [reportMeeting, setReportMeeting] = useState(null);
   const [reportTodo, setReportTodo] = useState(null);
+  const [reportKpi, setReportKpi] = useState(null);
   const [overallFrom, setOverallFrom] = useState(""); // empty = all time
   const [overallTo, setOverallTo] = useState("");
   const [overall, setOverall] = useState(null);
@@ -255,10 +258,39 @@ export default function Dashboard() {
         if (!cancelled) setReportTodo({ error: "DB_ERROR", message: String(e) });
       });
 
+    fetch(`/api/report/kpi?${base.toString()}`)
+      .then((r) => r.json())
+      .then((j) => {
+        if (!cancelled) setReportKpi(j);
+      })
+      .catch((e) => {
+        if (!cancelled) setReportKpi({ error: "DB_ERROR", message: String(e) });
+      });
+
     return () => {
       cancelled = true;
     };
   }, [tab, reportFrom, reportTo, refreshTick]);
+
+  // load the standalone Meeting tab (independent date range from the Report tab)
+  useEffect(() => {
+    if (tab !== "Meeting") return;
+    let cancelled = false;
+    const p = new URLSearchParams({ meeting: "1" });
+    if (meetingFrom) p.set("from", meetingFrom);
+    if (meetingTo) p.set("to", meetingTo);
+    fetch(`/api/planned?${p.toString()}`)
+      .then((r) => r.json())
+      .then((j) => {
+        if (!cancelled) setMeetingTabData(j);
+      })
+      .catch((e) => {
+        if (!cancelled) setMeetingTabData({ error: "DB_ERROR", message: String(e) });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [tab, meetingFrom, meetingTo, refreshTick]);
 
   // load the Overall Summary tab (One-Time + Meeting + To-Do combined per person)
   // — real-time: refetches on range change and every refresh tick.
@@ -559,12 +591,15 @@ export default function Dashboard() {
                 to={reportTo}
                 onFrom={setReportFrom}
                 onTo={setReportTo}
-                section={reportSection}
-                onSection={setReportSection}
                 planned={reportPlanned}
                 meeting={reportMeeting}
                 todo={reportTodo}
+                kpi={reportKpi}
               />
+            )}
+
+            {tab === "Meeting" && (
+              <MeetingTab from={meetingFrom} to={meetingTo} onFrom={setMeetingFrom} onTo={setMeetingTo} data={meetingTabData} />
             )}
           </>
         )}
@@ -1251,6 +1286,11 @@ function RecurringPersonSection({ kind, title, recurring, person }) {
                 <tr key={t.task_gid} className="border-b border-gray-100 dark:border-gray-900">
                   <td className="py-1.5 px-2">
                     {t.task}
+                    {t.has_due && t.current_due && (
+                      <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-600 dark:bg-indigo-950/50 dark:text-indigo-300">
+                        due {t.current_due}
+                      </span>
+                    )}
                     {!t.has_due && (
                       <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400">
                         no due date
@@ -1421,61 +1461,201 @@ function PerformancePersonDrawer({ person, tasks, onClose, onSelectTask }) {
   );
 }
 
-// ====================== Report tab (Planned vs Actual / Meeting / To-Do, by date range) ======================
-const REPORT_SECTIONS = [
-  { key: "planned", label: "Planned vs Actual (One-Time)" },
-  { key: "todo", label: "To-Do" },
-  { key: "meeting", label: "Meeting" },
+// ====================== Report tab (Overall score combining One-Time, Meeting, To-Do) ======================
+// Only these people appear in the Report tab — matched by first
+// name (case-insensitive), so "Sheetal" matches "Sheetal Shriyan" in the data.
+const REPORT_ROSTER = [
+  "prathamesh", "meghna", "ruta", "ashutosh", "tabassum", "tabasum", "mahima", "payal", "sheetal",
+  "divya", "lalit", "sharvari", "sejal", "dipti", "arjun", "mayuri", "supritha", "batul",
+  "abdul", "arya", "ayyan", "shreya",
 ];
-function ReportTab({ from, to, onFrom, onTo, section, onSection, planned, meeting, todo }) {
+// "Sakshi" alone is ambiguous (Sakshi C vs Sakshi Mishra) — only the former is wanted.
+const REPORT_EXACT_NAMES = ["sakshi c"];
+function inReportRoster(name) {
+  const n = (name || "").trim().toLowerCase();
+  if (REPORT_EXACT_NAMES.includes(n)) return true;
+  const first = n.split(/\s+/)[0];
+  return REPORT_ROSTER.includes(first);
+}
+
+// Small combined KPI strip above the Report tab: One-Time (excl. "CRM" and
+// "Recruitment" boards) + To-Do combined, Meeting folded in already (it's a
+// subset of One-Time). Workspace-wide — not scoped to the 22-person roster.
+function ReportKpiBox({ kpi }) {
+  if (!kpi) return null;
+  if (kpi.error) {
+    return (
+      <Panel>
+        <p className="text-sm text-amber-600 dark:text-amber-400">{kpi.message || "Combined KPI not ready — run the required SQL in Supabase."}</p>
+      </Panel>
+    );
+  }
+  return (
+    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+      <KPI label="Total" value={kpi.total} color="text-indigo-600 dark:text-indigo-400" />
+      <KPI label="Completed" value={kpi.completed} color="text-green-600 dark:text-green-400" />
+      <KPI label="Overdue" value={kpi.overdue} color="text-red-600 dark:text-red-400" />
+      <KPI label="No Date Set" value={kpi.noDate} color="text-gray-500 dark:text-gray-400" />
+      <KPI label="Unassigned" value={kpi.unassigned} color="text-gray-500 dark:text-gray-400" />
+    </div>
+  );
+}
+function ReportTab({ from, to, onFrom, onTo, planned, meeting, todo, kpi }) {
+  const [q, setQ] = useState("");
   return (
     <div className="space-y-4">
+      <ReportKpiBox kpi={kpi} />
+
       <Panel>
-        <div className="flex flex-wrap items-end justify-between gap-3">
-          <div className="flex flex-wrap items-end gap-3">
-            <div>
-              <label className="filter-label">From</label>
-              <input type="date" value={from} onChange={(e) => onFrom(e.target.value)} className="filter-input" />
-            </div>
-            <div>
-              <label className="filter-label">To</label>
-              <input type="date" value={to} onChange={(e) => onTo(e.target.value)} className="filter-input" />
-            </div>
+        <div className="flex flex-wrap items-end gap-3">
+          <div>
+            <label className="filter-label">From</label>
+            <input type="date" value={from} onChange={(e) => onFrom(e.target.value)} className="filter-input" />
           </div>
-          <div className="flex gap-2">
-            {REPORT_SECTIONS.map((s) => (
-              <button
-                key={s.key}
-                onClick={() => onSection(s.key)}
-                className={`px-3 py-1.5 rounded-lg text-sm font-semibold transition ${
-                  section === s.key
-                    ? "bg-indigo-600 text-white"
-                    : "bg-gray-100 dark:bg-[#1a1a1a] text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-[#242424]"
-                }`}
-              >
-                {s.label}
-              </button>
-            ))}
+          <div>
+            <label className="filter-label">To</label>
+            <input type="date" value={to} onChange={(e) => onTo(e.target.value)} className="filter-input" />
+          </div>
+          <div className="flex-1 min-w-[160px]">
+            <label className="filter-label">Search</label>
+            <input
+              type="text"
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="Filter by name…"
+              className="filter-input w-full"
+            />
           </div>
         </div>
         <p className="text-xs text-gray-400 mt-2">
-          Blank From/To = all time for Planned vs Actual and Meeting. To-Do always scores a bounded window (ticks ÷ tasks ×
-          days) — blank defaults to the last 90 days rather than all time, since a multi-year span would inflate the
-          denominator for recently-added tasks.
+          Blank From/To = all time for One-Time and Meeting. To-Do always scores a bounded window (ticks ÷ tasks ×
+          days) — blank defaults to the current week (Daily) and last 6/4 periods (Weekly…Quarterly), same as the To-Do
+          Tasks tab, rather than all time, since a multi-year span would inflate the denominator for recently-added tasks.
         </p>
       </Panel>
 
-      {section === "planned" && <ReportScoreTable title="Planned vs Actual (One-Time)" data={planned} columns="full" />}
-      {section === "meeting" && <ReportScoreTable title="Meeting" data={meeting} columns="full" />}
-      {section === "todo" && <ReportScoreTable title="To-Do" data={todo} columns="todo" />}
+      <ReportOverallTable planned={planned} meeting={meeting} todo={todo} q={q} />
     </div>
+  );
+}
+
+// One row per person: To-Do (score, total), One-Time (score, total, completed,
+// overdue, no-date), Meeting (score, total, completed, overdue, no-date — a
+// SUBSET of One-Time, not additional), then Avg — the mean of whichever of the
+// 3 scores this person actually has. A missing section is skipped, not treated
+// as 0, so it never unfairly drags the average down.
+function ReportOverallTable({ planned, meeting, todo, q }) {
+  if (!planned || !meeting || !todo) return <Panel><p className="text-sm text-gray-500">Loading overall…</p></Panel>;
+  const err = planned.error || meeting.error || todo.error;
+  if (err) {
+    return (
+      <Panel>
+        <p className="font-semibold text-amber-600 dark:text-amber-400 mb-1">Overall not ready</p>
+        <p className="text-sm text-gray-500">{(planned.error || meeting.error || todo.error).message || "Run the required SQL in Supabase."}</p>
+      </Panel>
+    );
+  }
+  const toOneTimeShape = (r) => ({
+    score: r.score,
+    total: r.total,
+    completed: r.planned - r.not_done,
+    overdue: r.not_done,
+    noDate: r.unplanned,
+  });
+  const plannedByName = new Map((planned.rows || []).map((r) => [r.assignee, toOneTimeShape(r)]));
+  const meetingByName = new Map((meeting.rows || []).map((r) => [r.assignee, toOneTimeShape(r)]));
+  const todoByName = new Map((todo.rows || []).map((r) => [r.person, { score: r.score, total: r.total }]));
+  const names = new Set([...plannedByName.keys(), ...meetingByName.keys(), ...todoByName.keys()]);
+
+  const s = q.trim().toLowerCase();
+  const rows = [...names]
+    .filter(inReportRoster)
+    .filter((n) => !s || n.toLowerCase().includes(s))
+    .map((name) => {
+      const oneTime = plannedByName.get(name) || null;
+      const meet = meetingByName.get(name) || null;
+      const td = todoByName.get(name) || null;
+      const available = [td?.score, oneTime?.score, meet?.score].filter((x) => x != null);
+      const avg = available.length ? Math.round(available.reduce((a, b) => a + b, 0) / available.length) : null;
+      return { name, oneTime, meet, td, avg };
+    })
+    .sort((a, b) => (a.avg ?? 1) - (b.avg ?? 1));
+
+  const scoreCell = (v) =>
+    v == null ? (
+      <span className="text-gray-400">—</span>
+    ) : (
+      <span className={`inline-block px-2 py-1 rounded-md text-xs font-semibold ${scoreBadge(v)}`}>{v}%</span>
+    );
+  const num = (v) => (v == null ? <span className="text-gray-400">—</span> : v);
+  // A visible divider at the start of each column group (To-Do / One-Time / Meeting / Avg).
+  const grp = "border-l-2 border-gray-300 dark:border-gray-600";
+
+  return (
+    <Panel>
+      <h2 className="font-semibold text-sm mb-1">Overall — scores side by side</h2>
+      <p className="text-xs text-gray-400 mb-3">
+        <span className="font-semibold">Avg</span> is the mean of whichever of the 3 scores this person actually has —
+        a missing section is skipped, not counted as 0, so it never unfairly drags the average down. Meeting's columns
+        are a <span className="font-semibold">subset</span> of One-Time's, not additional tasks on top.
+      </p>
+      <div className="overflow-x-auto max-h-[65vh]">
+        <table className="w-full text-sm">
+          <thead className="sticky top-0 bg-white dark:bg-[#141414]">
+            <tr className="text-left text-xs uppercase tracking-wide text-gray-400 border-b border-gray-200 dark:border-gray-800">
+              <th className="py-2.5 px-2">Name</th>
+              <th className={`py-2.5 px-2 ${grp}`}>To-Do Score</th>
+              <th className="py-2.5 px-2">To-Do Total</th>
+              <th className={`py-2.5 px-2 ${grp}`}>One-Time Score</th>
+              <th className="py-2.5 px-2">One-Time Total</th>
+              <th className="py-2.5 px-2">One-Time Completed</th>
+              <th className="py-2.5 px-2">One-Time Overdue</th>
+              <th className="py-2.5 px-2">One-Time No date (PD)</th>
+              <th className={`py-2.5 px-2 ${grp}`}>Meeting Score</th>
+              <th className="py-2.5 px-2">Meeting Total</th>
+              <th className="py-2.5 px-2">Meeting Completed</th>
+              <th className="py-2.5 px-2">Meeting Overdue</th>
+              <th className="py-2.5 px-2">Meeting No date (Due or PD)</th>
+              <th className={`py-2.5 px-2 ${grp}`}>Avg</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.length === 0 && (
+              <tr>
+                <td colSpan={14} className="py-6 text-center text-gray-400">
+                  No data for this range.
+                </td>
+              </tr>
+            )}
+            {rows.map((r) => (
+              <tr key={r.name} className="border-b border-gray-100 dark:border-gray-900 hover:bg-gray-50 dark:hover:bg-[#1a1a1a]">
+                <td className="py-2.5 px-2 font-medium">{r.name}</td>
+                <td className={`py-2.5 px-2 ${grp}`}>{scoreCell(r.td?.score)}</td>
+                <td className="py-2.5 px-2">{num(r.td?.total)}</td>
+                <td className={`py-2.5 px-2 ${grp}`}>{scoreCell(r.oneTime?.score)}</td>
+                <td className="py-2.5 px-2">{num(r.oneTime?.total)}</td>
+                <td className="py-2.5 px-2 text-green-600 dark:text-green-400">{num(r.oneTime?.completed)}</td>
+                <td className="py-2.5 px-2 text-red-600 dark:text-red-400">{num(r.oneTime?.overdue)}</td>
+                <td className="py-2.5 px-2 text-gray-500">{num(r.oneTime?.noDate)}</td>
+                <td className={`py-2.5 px-2 ${grp}`}>{scoreCell(r.meet?.score)}</td>
+                <td className="py-2.5 px-2">{num(r.meet?.total)}</td>
+                <td className="py-2.5 px-2 text-green-600 dark:text-green-400">{num(r.meet?.completed)}</td>
+                <td className="py-2.5 px-2 text-red-600 dark:text-red-400">{num(r.meet?.overdue)}</td>
+                <td className="py-2.5 px-2 text-gray-500">{num(r.meet?.noDate)}</td>
+                <td className={`py-2.5 px-2 ${grp}`}>{scoreCell(r.avg)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Panel>
   );
 }
 
 // `columns="full"` rows come from mis_planned_actual: { assignee, total, unplanned, planned, on_time, late,
 // delay_over_1week, not_done, score }. `columns="todo"` rows come from /api/report/todo: { person, total, completed, score }
 // — only Total + Score are shown for To-Do, per the simpler recurring-task model (no overdue/no-date concept there).
-function ReportScoreTable({ title, data, columns }) {
+function ReportScoreTable({ title, data, columns, q }) {
   if (!data) return <Panel><p className="text-sm text-gray-500">Loading {title.toLowerCase()}…</p></Panel>;
   if (data.error) {
     return (
@@ -1485,18 +1665,22 @@ function ReportScoreTable({ title, data, columns }) {
       </Panel>
     );
   }
-  const rows = (data.rows || []).map((r) =>
-    columns === "todo"
-      ? { name: r.person, total: r.total, score: r.score }
-      : {
-          name: r.assignee,
-          total: r.total,
-          completed: r.planned - r.not_done,
-          overdue: r.not_done,
-          noDate: r.unplanned,
-          score: r.score,
-        }
-  );
+  const s = q.trim().toLowerCase();
+  const rows = (data.rows || [])
+    .filter((r) => inReportRoster(columns === "todo" ? r.person : r.assignee))
+    .filter((r) => !s || (columns === "todo" ? r.person : r.assignee).toLowerCase().includes(s))
+    .map((r) =>
+      columns === "todo"
+        ? { name: r.person, total: r.total, score: r.score }
+        : {
+            name: r.assignee,
+            total: r.total,
+            completed: r.planned - r.not_done,
+            overdue: r.not_done,
+            noDate: r.unplanned,
+            score: r.score,
+          }
+    );
   return (
     <Panel>
       <h2 className="font-semibold text-sm mb-3">{title}</h2>
@@ -1540,6 +1724,42 @@ function ReportScoreTable({ title, data, columns }) {
         </table>
       </div>
     </Panel>
+  );
+}
+
+// ====================== Meeting tab (standalone — same scoring as Planned vs Actual, scoped to meeting APs) ======================
+function MeetingTab({ from, to, onFrom, onTo, data }) {
+  const [q, setQ] = useState("");
+  return (
+    <div className="space-y-4">
+      <Panel>
+        <p className="text-xs text-gray-400 mb-3">
+          Meeting action points — a <span className="font-semibold">subset</span> of your One-Time tasks, scored the same
+          way (on-time ≤ planned date, late ≤7 days counts, &gt;7 days is neutral). Blank From/To = all time.
+        </p>
+        <div className="flex flex-wrap items-end gap-3">
+          <div>
+            <label className="filter-label">From</label>
+            <input type="date" value={from} onChange={(e) => onFrom(e.target.value)} className="filter-input" />
+          </div>
+          <div>
+            <label className="filter-label">To</label>
+            <input type="date" value={to} onChange={(e) => onTo(e.target.value)} className="filter-input" />
+          </div>
+          <div className="flex-1 min-w-[160px]">
+            <label className="filter-label">Search</label>
+            <input
+              type="text"
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="Filter by name…"
+              className="filter-input w-full"
+            />
+          </div>
+        </div>
+      </Panel>
+      <ReportScoreTable title="Meeting" data={data} columns="full" q={q} />
+    </div>
   );
 }
 

@@ -371,3 +371,45 @@ returns jsonb language sql stable as $$
   ) order by assignee), '[]'::jsonb)
   from s;
 $$;
+
+-- ---- Combined KPI box (One-Time only; excludes the "CRM" and "Recruitment" boards) ----
+-- One row, not per-person — total/completed/overdue/pending/no_date/unassigned
+-- across everyone, same effective-date + meeting-dedup logic as mis_planned_actual.
+-- Used by the small stat box above the Report tab. To-Do's contribution is
+-- combined in JS (it has no board-based exclusion concept of its own).
+create or replace function mis_combined_kpi(p_from date default null, p_to date default null)
+returns jsonb language sql stable as $$
+  with raw as (
+    select assignee, created_at, completed,
+      coalesce(planned_end_date::date, due_on::date) as eff_date,
+      row_number() over (
+        partition by assignee,
+          case when is_meeting then 1 else 0 end,
+          case when is_meeting then lower(trim(regexp_replace(coalesce(parent_name, ''), '\s+', ' ', 'g'))) else gid end,
+          case when is_meeting then lower(trim(regexp_replace(coalesce(name, ''), '\s+', ' ', 'g'))) end
+        order by (planned_end_date is not null) desc, completed desc
+      ) as rn
+    from mis_tasks
+    where is_one_time
+      and coalesce(archived, false) = false
+      and not (coalesce(projects, '[]'::jsonb) ? 'CRM')
+      and not (coalesce(projects, '[]'::jsonb) ? 'Recruitment')
+  ),
+  scoped as (
+    select assignee, completed, eff_date from raw
+    where rn = 1
+      and (
+        (eff_date is not null and (p_from is null or eff_date >= p_from) and (p_to is null or eff_date <= p_to))
+        or (eff_date is null and (p_from is null or created_at::date >= p_from) and (p_to is null or created_at::date <= p_to))
+      )
+  )
+  select jsonb_build_object(
+    'total', count(*),
+    'completed', count(*) filter (where completed),
+    'overdue', count(*) filter (where not completed and eff_date is not null and eff_date < current_date),
+    'pending', count(*) filter (where not completed and eff_date is not null and eff_date >= current_date),
+    'no_date', count(*) filter (where not completed and eff_date is null),
+    'unassigned', count(*) filter (where assignee = 'Unassigned')
+  )
+  from scoped;
+$$;
