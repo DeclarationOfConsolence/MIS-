@@ -68,7 +68,9 @@ export default function Dashboard() {
   const [meetingFrom, setMeetingFrom] = useState(""); // empty = all time
   const [meetingTo, setMeetingTo] = useState("");
   const [meetingTabData, setMeetingTabData] = useState(null);
-  const [trackerWeekOffset, setTrackerWeekOffset] = useState(0); // 0 = current week
+  const defaultTrackerWeek = trackerWeekBounds(0);
+  const [trackerFrom, setTrackerFrom] = useState(defaultTrackerWeek.from); // freely editable — not locked to Tue–Mon
+  const [trackerTo, setTrackerTo] = useState(defaultTrackerWeek.to);
   const [trackerPlanned, setTrackerPlanned] = useState(null);
   const [trackerMeeting, setTrackerMeeting] = useState(null);
   const [trackerTodo, setTrackerTodo] = useState(null);
@@ -318,9 +320,9 @@ export default function Dashboard() {
   // weekly blocks). Actual comes from the same endpoints as Report; Target is
   // whatever's been saved for that exact week (each week starts blank).
   useEffect(() => {
-    if (tab !== "Tracker") return;
+    if (tab !== "Tracker" || !trackerFrom || !trackerTo) return;
     let cancelled = false;
-    const { from, to } = trackerWeekBounds(trackerWeekOffset);
+    const from = trackerFrom, to = trackerTo;
     const base = new URLSearchParams({ from, to });
 
     fetch(`/api/planned?${base.toString()}`)
@@ -370,7 +372,7 @@ export default function Dashboard() {
     return () => {
       cancelled = true;
     };
-  }, [tab, trackerWeekOffset, refreshTick]);
+  }, [tab, trackerFrom, trackerTo, refreshTick]);
 
   // load the Overall Summary tab (One-Time + Meeting + To-Do combined per person)
   // — real-time: refetches on range change and every refresh tick.
@@ -472,11 +474,10 @@ export default function Dashboard() {
       next[assignee] = { ...(next[assignee] || {}), [category]: score };
       return next;
     });
-    const { from } = trackerWeekBounds(trackerWeekOffset);
     fetch("/api/report/targets", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ assignee, category, week_start: from, target_score: score }),
+      body: JSON.stringify({ assignee, category, week_start: trackerFrom, target_score: score }),
     }).catch(() => {});
   }
 
@@ -700,8 +701,10 @@ export default function Dashboard() {
 
             {tab === "Tracker" && (
               <TrackerTab
-                weekOffset={trackerWeekOffset}
-                onWeekOffset={setTrackerWeekOffset}
+                from={trackerFrom}
+                to={trackerTo}
+                onFrom={setTrackerFrom}
+                onTo={setTrackerTo}
                 planned={trackerPlanned}
                 meeting={trackerMeeting}
                 todo={trackerTodo}
@@ -1872,10 +1875,14 @@ function MeetingTab({ from, to, onFrom, onTo, data }) {
 }
 
 // ====================== Tracker (Actual / Target / Diff, by week — like the EM sheet's weekly blocks) ======================
-function TrackerTab({ weekOffset, onWeekOffset, planned, meeting, todo, targets, onSaveTarget }) {
+// Shift a 'YYYY-MM-DD' date string by N days.
+function shiftDateStr(dateStr, days) {
+  const d = new Date(dateStr + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+function TrackerTab({ from, to, onFrom, onTo, planned, meeting, todo, targets, onSaveTarget }) {
   const [q, setQ] = useState("");
-  const { from, to } = trackerWeekBounds(weekOffset);
-  const label = `${new Date(from + "T00:00:00Z").toLocaleDateString("en-GB", { day: "numeric", month: "short" })} – ${new Date(to + "T00:00:00Z").toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" })}`;
 
   if (!planned || !meeting || !todo || !targets) {
     return <Panel><p className="text-sm text-gray-500">Loading tracker…</p></Panel>;
@@ -1918,29 +1925,42 @@ function TrackerTab({ weekOffset, onWeekOffset, planned, meeting, todo, targets,
     })
     .sort((a, b) => a.name.localeCompare(b.name));
 
+  const shiftBoth = (days) => {
+    onFrom(shiftDateStr(from, days));
+    onTo(shiftDateStr(to, days));
+  };
+
   return (
     <div className="space-y-4">
       <Panel>
-        <div className="flex items-center justify-between gap-3 mb-3">
-          <button className="btn-ghost" onClick={() => onWeekOffset(weekOffset + 1)}>◂ Prev week</button>
-          <span className="font-semibold text-sm">{label}</span>
-          <button className="btn-ghost" disabled={weekOffset === 0} onClick={() => onWeekOffset(Math.max(0, weekOffset - 1))}>
-            Next week ▸
-          </button>
-        </div>
-        <div className="max-w-xs">
-          <label className="filter-label">Search</label>
-          <input
-            type="text"
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            placeholder="Filter by name…"
-            className="filter-input w-full"
-          />
+        <div className="flex flex-wrap items-end justify-between gap-3 mb-3">
+          <div className="flex flex-wrap items-end gap-3">
+            <button className="btn-ghost" onClick={() => shiftBoth(-7)}>◂ Prev week</button>
+            <div>
+              <label className="filter-label">From</label>
+              <input type="date" value={from} onChange={(e) => onFrom(e.target.value)} className="filter-input" />
+            </div>
+            <div>
+              <label className="filter-label">To</label>
+              <input type="date" value={to} onChange={(e) => onTo(e.target.value)} className="filter-input" />
+            </div>
+            <button className="btn-ghost" onClick={() => shiftBoth(7)}>Next week ▸</button>
+          </div>
+          <div className="max-w-xs flex-1 min-w-[160px]">
+            <label className="filter-label">Search</label>
+            <input
+              type="text"
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="Filter by name…"
+              className="filter-input w-full"
+            />
+          </div>
         </div>
         <p className="text-xs text-gray-400 mt-2">
-          Each week starts with a blank Target — type a value (−100 to 0) and click away to save. Diff = Actual − Target
-          (positive = beat the target, negative = missed it). Nothing saved for the week yet shows as —.
+          Pick any From/To directly, or use Prev/Next to step a full week at a time — defaults to the current Tue–Mon
+          week. Each distinct From date starts with a blank Target — type a value (−100 to 0) and click away to save.
+          Diff = Actual − Target (positive = beat the target, negative = missed it). Nothing saved yet shows as —.
         </p>
       </Panel>
       <TrackerTable rows={rows} onSaveTarget={onSaveTarget} />
@@ -1948,31 +1968,37 @@ function TrackerTab({ weekOffset, onWeekOffset, planned, meeting, todo, targets,
   );
 }
 
+// Editable target, styled like the score badges elsewhere (colored by value,
+// "%" suffix) so a set target reads the same way an Actual score does.
 function TargetInput({ value, onCommit }) {
   const [draft, setDraft] = useState(value == null ? "" : String(value));
   useEffect(() => {
     setDraft(value == null ? "" : String(value));
   }, [value]);
+  const badgeCls = value == null ? "bg-gray-100 text-gray-400 dark:bg-gray-800 dark:text-gray-500" : scoreBadge(value);
   return (
-    <input
-      type="number"
-      min={-100}
-      max={0}
-      value={draft}
-      onChange={(e) => setDraft(e.target.value)}
-      onBlur={() => {
-        const trimmed = draft.trim();
-        if (trimmed === "") {
-          if (value != null) onCommit(null);
-          return;
-        }
-        const n = Math.max(-100, Math.min(0, Math.round(Number(trimmed))));
-        setDraft(String(n));
-        if (n !== value) onCommit(n);
-      }}
-      placeholder="—"
-      className="w-16 px-1.5 py-1 rounded-md border border-gray-200 dark:border-gray-800 bg-white dark:bg-[#1a1a1a] text-xs text-center"
-    />
+    <span className={`inline-flex items-center gap-0.5 pl-1.5 pr-2 py-1 rounded-md text-xs font-semibold ${badgeCls}`}>
+      <input
+        type="number"
+        min={-100}
+        max={0}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={() => {
+          const trimmed = draft.trim();
+          if (trimmed === "") {
+            if (value != null) onCommit(null);
+            return;
+          }
+          const n = Math.max(-100, Math.min(0, Math.round(Number(trimmed))));
+          setDraft(String(n));
+          if (n !== value) onCommit(n);
+        }}
+        placeholder="—"
+        className="w-10 bg-transparent text-center outline-none"
+      />
+      <span>%</span>
+    </span>
   );
 }
 
