@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { StatusDonut, PerAssigneeBar, PerProjectBar } from "@/components/Charts";
 import Logo from "@/components/Logo";
 
-const TABS = ["Overall Summary", "Report", "Meeting", "One Time Tasks", "To-Do Tasks", "Planned vs Actual", "Tasks", "Team", "Charts", "Activity"];
+const TABS = ["Overall Summary", "Report", "Tracker", "Meeting", "One Time Tasks", "To-Do Tasks", "Planned vs Actual", "Tasks", "Team", "Charts", "Activity"];
 
 // Monday–Saturday week bounds (IST), for a given offset (0 = current week, 1 = last week, …).
 function weekBounds(offset) {
@@ -19,6 +19,23 @@ function weekBounds(offset) {
   saturday.setUTCDate(monday.getUTCDate() + 5);
   const fmt = (x) => x.toISOString().slice(0, 10);
   return { from: fmt(monday), to: fmt(saturday) };
+}
+
+// Tuesday–Monday week bounds (IST), for the Tracker — matches the EM sheet's
+// actual week cycle (e.g. 6 Oct–12 Oct), NOT Monday–Saturday like the rest of
+// the dashboard. offset 0 = the current such week (ends on the most recent
+// Monday, today if today IS Monday).
+function trackerWeekBounds(offset) {
+  const istToday = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+  const base = new Date(istToday + "T00:00:00Z");
+  const dow = base.getUTCDay(); // 0 Sun .. 6 Sat
+  const daysSinceTuesday = (dow - 2 + 7) % 7;
+  const tuesday = new Date(base);
+  tuesday.setUTCDate(base.getUTCDate() - daysSinceTuesday - offset * 7);
+  const monday = new Date(tuesday);
+  monday.setUTCDate(tuesday.getUTCDate() + 6);
+  const fmt = (x) => x.toISOString().slice(0, 10);
+  return { from: fmt(tuesday), to: fmt(monday) };
 }
 
 export default function Dashboard() {
@@ -51,6 +68,11 @@ export default function Dashboard() {
   const [meetingFrom, setMeetingFrom] = useState(""); // empty = all time
   const [meetingTo, setMeetingTo] = useState("");
   const [meetingTabData, setMeetingTabData] = useState(null);
+  const [trackerWeekOffset, setTrackerWeekOffset] = useState(0); // 0 = current week
+  const [trackerPlanned, setTrackerPlanned] = useState(null);
+  const [trackerMeeting, setTrackerMeeting] = useState(null);
+  const [trackerTodo, setTrackerTodo] = useState(null);
+  const [trackerTargets, setTrackerTargets] = useState(null); // { assignee: { one_time, todo, meeting } }
   const [reportPlanned, setReportPlanned] = useState(null);
   const [reportMeeting, setReportMeeting] = useState(null);
   const [reportTodo, setReportTodo] = useState(null);
@@ -292,6 +314,64 @@ export default function Dashboard() {
     };
   }, [tab, meetingFrom, meetingTo, refreshTick]);
 
+  // load the Tracker tab (Actual / Target / Diff, by week — like the EM sheet's
+  // weekly blocks). Actual comes from the same endpoints as Report; Target is
+  // whatever's been saved for that exact week (each week starts blank).
+  useEffect(() => {
+    if (tab !== "Tracker") return;
+    let cancelled = false;
+    const { from, to } = trackerWeekBounds(trackerWeekOffset);
+    const base = new URLSearchParams({ from, to });
+
+    fetch(`/api/planned?${base.toString()}`)
+      .then((r) => r.json())
+      .then((j) => {
+        if (!cancelled) setTrackerPlanned(j);
+      })
+      .catch((e) => {
+        if (!cancelled) setTrackerPlanned({ error: "DB_ERROR", message: String(e) });
+      });
+
+    const mp = new URLSearchParams(base);
+    mp.set("meeting", "1");
+    fetch(`/api/planned?${mp.toString()}`)
+      .then((r) => r.json())
+      .then((j) => {
+        if (!cancelled) setTrackerMeeting(j);
+      })
+      .catch((e) => {
+        if (!cancelled) setTrackerMeeting({ error: "DB_ERROR", message: String(e) });
+      });
+
+    fetch(`/api/report/todo?${base.toString()}`)
+      .then((r) => r.json())
+      .then((j) => {
+        if (!cancelled) setTrackerTodo(j);
+      })
+      .catch((e) => {
+        if (!cancelled) setTrackerTodo({ error: "DB_ERROR", message: String(e) });
+      });
+
+    fetch(`/api/report/targets?week_start=${from}`)
+      .then((r) => r.json())
+      .then((j) => {
+        if (cancelled) return;
+        const map = {};
+        for (const t of j.targets || []) {
+          map[t.assignee] = map[t.assignee] || {};
+          map[t.assignee][t.category] = t.target_score;
+        }
+        setTrackerTargets(map);
+      })
+      .catch((e) => {
+        if (!cancelled) setTrackerTargets({ error: "DB_ERROR", message: String(e) });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [tab, trackerWeekOffset, refreshTick]);
+
   // load the Overall Summary tab (One-Time + Meeting + To-Do combined per person)
   // — real-time: refetches on range change and every refresh tick.
   useEffect(() => {
@@ -382,6 +462,22 @@ export default function Dashboard() {
     } finally {
       setSyncing(false);
     }
+  }
+
+  // Save one Tracker target (optimistic update, then persist). category is
+  // 'one_time' | 'todo' | 'meeting'; score null clears it.
+  function saveTrackerTarget(assignee, category, score) {
+    setTrackerTargets((prev) => {
+      const next = { ...(prev || {}) };
+      next[assignee] = { ...(next[assignee] || {}), [category]: score };
+      return next;
+    });
+    const { from } = trackerWeekBounds(trackerWeekOffset);
+    fetch("/api/report/targets", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ assignee, category, week_start: from, target_score: score }),
+    }).catch(() => {});
   }
 
   function resetFilters() {
@@ -600,6 +696,18 @@ export default function Dashboard() {
 
             {tab === "Meeting" && (
               <MeetingTab from={meetingFrom} to={meetingTo} onFrom={setMeetingFrom} onTo={setMeetingTo} data={meetingTabData} />
+            )}
+
+            {tab === "Tracker" && (
+              <TrackerTab
+                weekOffset={trackerWeekOffset}
+                onWeekOffset={setTrackerWeekOffset}
+                planned={trackerPlanned}
+                meeting={trackerMeeting}
+                todo={trackerTodo}
+                targets={trackerTargets}
+                onSaveTarget={saveTrackerTarget}
+              />
             )}
           </>
         )}
@@ -1760,6 +1868,196 @@ function MeetingTab({ from, to, onFrom, onTo, data }) {
       </Panel>
       <ReportScoreTable title="Meeting" data={data} columns="full" q={q} />
     </div>
+  );
+}
+
+// ====================== Tracker (Actual / Target / Diff, by week — like the EM sheet's weekly blocks) ======================
+function TrackerTab({ weekOffset, onWeekOffset, planned, meeting, todo, targets, onSaveTarget }) {
+  const [q, setQ] = useState("");
+  const { from, to } = trackerWeekBounds(weekOffset);
+  const label = `${new Date(from + "T00:00:00Z").toLocaleDateString("en-GB", { day: "numeric", month: "short" })} – ${new Date(to + "T00:00:00Z").toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" })}`;
+
+  if (!planned || !meeting || !todo || !targets) {
+    return <Panel><p className="text-sm text-gray-500">Loading tracker…</p></Panel>;
+  }
+  const err = planned.error || meeting.error || todo.error || targets.error;
+  if (err) {
+    return (
+      <Panel>
+        <p className="font-semibold text-amber-600 dark:text-amber-400 mb-1">Tracker not ready</p>
+        <p className="text-sm text-gray-500">
+          {(planned.error || meeting.error || todo.error || targets.error).message || "Run supabase/targets.sql in Supabase, then reload."}
+        </p>
+      </Panel>
+    );
+  }
+
+  const toOneTimeShape = (r) => ({
+    score: r.score,
+    total: r.total,
+    completed: r.planned - r.not_done,
+    pending: r.not_done,
+  });
+  const plannedByName = new Map((planned.rows || []).map((r) => [r.assignee, toOneTimeShape(r)]));
+  const meetingByName = new Map((meeting.rows || []).map((r) => [r.assignee, toOneTimeShape(r)]));
+  const todoByName = new Map((todo.rows || []).map((r) => [r.person, { score: r.score, total: r.total }]));
+  const names = new Set([...plannedByName.keys(), ...meetingByName.keys(), ...todoByName.keys()]);
+
+  const s = q.trim().toLowerCase();
+  const rows = [...names]
+    .filter(inReportRoster)
+    .filter((n) => !s || n.toLowerCase().includes(s))
+    .map((name) => {
+      const oneTime = plannedByName.get(name) || null;
+      const meet = meetingByName.get(name) || null;
+      const td = todoByName.get(name) || null;
+      const target = targets[name] || {};
+      const available = [oneTime?.score, td?.score, meet?.score].filter((x) => x != null);
+      const avg = available.length ? Math.round(available.reduce((a, b) => a + b, 0) / available.length) : null;
+      return { name, oneTime, todo: td, meet, target, avg };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  return (
+    <div className="space-y-4">
+      <Panel>
+        <div className="flex items-center justify-between gap-3 mb-3">
+          <button className="btn-ghost" onClick={() => onWeekOffset(weekOffset + 1)}>◂ Prev week</button>
+          <span className="font-semibold text-sm">{label}</span>
+          <button className="btn-ghost" disabled={weekOffset === 0} onClick={() => onWeekOffset(Math.max(0, weekOffset - 1))}>
+            Next week ▸
+          </button>
+        </div>
+        <div className="max-w-xs">
+          <label className="filter-label">Search</label>
+          <input
+            type="text"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="Filter by name…"
+            className="filter-input w-full"
+          />
+        </div>
+        <p className="text-xs text-gray-400 mt-2">
+          Each week starts with a blank Target — type a value (−100 to 0) and click away to save. Diff = Actual − Target
+          (positive = beat the target, negative = missed it). Nothing saved for the week yet shows as —.
+        </p>
+      </Panel>
+      <TrackerTable rows={rows} onSaveTarget={onSaveTarget} />
+    </div>
+  );
+}
+
+function TargetInput({ value, onCommit }) {
+  const [draft, setDraft] = useState(value == null ? "" : String(value));
+  useEffect(() => {
+    setDraft(value == null ? "" : String(value));
+  }, [value]);
+  return (
+    <input
+      type="number"
+      min={-100}
+      max={0}
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={() => {
+        const trimmed = draft.trim();
+        if (trimmed === "") {
+          if (value != null) onCommit(null);
+          return;
+        }
+        const n = Math.max(-100, Math.min(0, Math.round(Number(trimmed))));
+        setDraft(String(n));
+        if (n !== value) onCommit(n);
+      }}
+      placeholder="—"
+      className="w-16 px-1.5 py-1 rounded-md border border-gray-200 dark:border-gray-800 bg-white dark:bg-[#1a1a1a] text-xs text-center"
+    />
+  );
+}
+
+function TrackerTable({ rows, onSaveTarget }) {
+  const grp = "border-l-2 border-gray-300 dark:border-gray-600";
+  const scoreCell = (v) =>
+    v == null ? (
+      <span className="text-gray-400">—</span>
+    ) : (
+      <span className={`inline-block px-2 py-1 rounded-md text-xs font-semibold ${scoreBadge(v)}`}>{v}%</span>
+    );
+  const num = (v) => (v == null ? <span className="text-gray-400">—</span> : v);
+  const diffCell = (actual, target) => {
+    if (actual == null || target == null) return <span className="text-gray-400">—</span>;
+    const diff = actual - target;
+    const cls = diff >= 0 ? "text-green-600 dark:text-green-400" : "text-red-600 dark:text-red-400";
+    return <span className={`font-semibold ${cls}`}>{diff > 0 ? "+" : ""}{diff}%</span>;
+  };
+
+  return (
+    <Panel>
+      <div className="overflow-x-auto max-h-[65vh]">
+        <table className="w-full text-sm">
+          <thead className="sticky top-0 bg-white dark:bg-[#141414]">
+            <tr className="text-left text-xs uppercase tracking-wide text-gray-400 border-b border-gray-200 dark:border-gray-800">
+              <th className="py-2.5 px-2">Name</th>
+              <th className={`py-2.5 px-2 ${grp}`}>One-Time Total</th>
+              <th className="py-2.5 px-2">One-Time Completed</th>
+              <th className="py-2.5 px-2">One-Time Pending</th>
+              <th className="py-2.5 px-2">One-Time Actual</th>
+              <th className="py-2.5 px-2">One-Time Target</th>
+              <th className="py-2.5 px-2">One-Time Diff</th>
+              <th className={`py-2.5 px-2 ${grp}`}>To-Do Total</th>
+              <th className="py-2.5 px-2">To-Do Actual</th>
+              <th className="py-2.5 px-2">To-Do Target</th>
+              <th className="py-2.5 px-2">To-Do Diff</th>
+              <th className={`py-2.5 px-2 ${grp}`}>Meeting Total</th>
+              <th className="py-2.5 px-2">Meeting Completed</th>
+              <th className="py-2.5 px-2">Meeting Pending</th>
+              <th className="py-2.5 px-2">Meeting Actual</th>
+              <th className="py-2.5 px-2">Meeting Target</th>
+              <th className="py-2.5 px-2">Meeting Diff</th>
+              <th className={`py-2.5 px-2 ${grp}`}>Avg Score</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.length === 0 && (
+              <tr>
+                <td colSpan={18} className="py-6 text-center text-gray-400">
+                  No data for this week.
+                </td>
+              </tr>
+            )}
+            {rows.map((r) => (
+              <tr key={r.name} className="border-b border-gray-100 dark:border-gray-900 hover:bg-gray-50 dark:hover:bg-[#1a1a1a]">
+                <td className="py-2.5 px-2 font-medium">{r.name}</td>
+                <td className={`py-2.5 px-2 ${grp}`}>{num(r.oneTime?.total)}</td>
+                <td className="py-2.5 px-2 text-green-600 dark:text-green-400">{num(r.oneTime?.completed)}</td>
+                <td className="py-2.5 px-2 text-amber-600 dark:text-amber-400">{num(r.oneTime?.pending)}</td>
+                <td className="py-2.5 px-2">{scoreCell(r.oneTime?.score)}</td>
+                <td className="py-2.5 px-2">
+                  <TargetInput value={r.target.one_time ?? null} onCommit={(v) => onSaveTarget(r.name, "one_time", v)} />
+                </td>
+                <td className="py-2.5 px-2">{diffCell(r.oneTime?.score, r.target.one_time ?? null)}</td>
+                <td className={`py-2.5 px-2 ${grp}`}>{num(r.todo?.total)}</td>
+                <td className="py-2.5 px-2">{scoreCell(r.todo?.score)}</td>
+                <td className="py-2.5 px-2">
+                  <TargetInput value={r.target.todo ?? null} onCommit={(v) => onSaveTarget(r.name, "todo", v)} />
+                </td>
+                <td className="py-2.5 px-2">{diffCell(r.todo?.score, r.target.todo ?? null)}</td>
+                <td className={`py-2.5 px-2 ${grp}`}>{num(r.meet?.total)}</td>
+                <td className="py-2.5 px-2 text-green-600 dark:text-green-400">{num(r.meet?.completed)}</td>
+                <td className="py-2.5 px-2 text-amber-600 dark:text-amber-400">{num(r.meet?.pending)}</td>
+                <td className="py-2.5 px-2">{scoreCell(r.meet?.score)}</td>
+                <td className="py-2.5 px-2">
+                  <TargetInput value={r.target.meeting ?? null} onCommit={(v) => onSaveTarget(r.name, "meeting", v)} />
+                </td>
+                <td className="py-2.5 px-2">{diffCell(r.meet?.score, r.target.meeting ?? null)}</td>
+                <td className={`py-2.5 px-2 ${grp}`}>{scoreCell(r.avg)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Panel>
   );
 }
 
