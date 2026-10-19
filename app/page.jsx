@@ -1467,7 +1467,7 @@ function PerformancePersonDrawer({ person, tasks, onClose, onSelectTask }) {
 const REPORT_ROSTER = [
   "prathamesh", "meghna", "ruta", "ashutosh", "tabassum", "tabasum", "mahima", "payal", "sheetal",
   "divya", "lalit", "sharvari", "sejal", "dipti", "arjun", "mayuri", "supritha", "batul",
-  "abdul", "arya", "ayyan", "shreya",
+  "abdul", "arya", "ayyan", "shreya", "varun",
 ];
 // "Sakshi" alone is ambiguous (Sakshi C vs Sakshi Mishra) — only the former is wanted.
 const REPORT_EXACT_NAMES = ["sakshi c"];
