@@ -47,9 +47,9 @@ export async function PUT(req) {
   if (!assignee || !CATEGORIES.includes(category) || !week_start) {
     return NextResponse.json({ error: "BAD_INPUT", message: "assignee, category, week_start required" }, { status: 400 });
   }
-  const score = target_score === null || target_score === undefined || target_score === "" ? null : Number(target_score);
-  if (score != null && (!Number.isFinite(score) || score < -100 || score > 0)) {
-    return NextResponse.json({ error: "BAD_INPUT", message: "target_score must be between -100 and 0" }, { status: 400 });
+  const score = target_score === null || target_score === undefined || target_score === "" ? null : Math.round(Number(target_score));
+  if (score != null && !Number.isFinite(score)) {
+    return NextResponse.json({ error: "BAD_INPUT", message: "target_score must be a number" }, { status: 400 });
   }
 
   const { error } = await sb

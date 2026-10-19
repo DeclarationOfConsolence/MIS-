@@ -1980,8 +1980,6 @@ function TargetInput({ value, onCommit }) {
     <span className={`inline-flex items-center gap-0.5 pl-1.5 pr-2 py-1 rounded-md text-xs font-semibold ${badgeCls}`}>
       <input
         type="number"
-        min={-100}
-        max={0}
         value={draft}
         onChange={(e) => setDraft(e.target.value)}
         onBlur={() => {
@@ -1990,7 +1988,11 @@ function TargetInput({ value, onCommit }) {
             if (value != null) onCommit(null);
             return;
           }
-          const n = Math.max(-100, Math.min(0, Math.round(Number(trimmed))));
+          const n = Math.round(Number(trimmed));
+          if (!Number.isFinite(n)) {
+            setDraft(value == null ? "" : String(value));
+            return;
+          }
           setDraft(String(n));
           if (n !== value) onCommit(n);
         }}
